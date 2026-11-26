@@ -166,6 +166,7 @@ fn translate_via_xcl(container: &[u8]) -> Result<HostShader, String> {
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
         root_indexed_views: Vec::new(),
+        half_views: Vec::new(),
     })
 }
 
@@ -319,6 +320,11 @@ fn encode(s: &HostShader, xcl_abi: bool) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    word(&mut out, s.half_views.len() as u32);
+    for &(slot, dword) in &s.half_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
     word(&mut out, u32::from(xcl_abi));
     out
 }
@@ -388,6 +394,11 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, bool)> {
             shift: u8::try_from(r.word()?).ok()?,
         });
     }
+    let n = r.word()? as usize;
+    let mut half_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     let xcl_abi = r.word()? != 0;
     r.0.is_empty().then_some((
         HostShader {
@@ -400,6 +411,7 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, bool)> {
             root_srvs,
             root_uavs,
             root_indexed_views,
+            half_views,
         },
         xcl_abi,
     ))
@@ -430,6 +442,7 @@ mod tests {
             root_srvs: vec![0, 3],
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            half_views: vec![(0, 8), (4, 0)],
         }
     }
 
