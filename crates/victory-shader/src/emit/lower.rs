@@ -10689,8 +10689,12 @@ impl<'a> Lower<'a> {
                 .min(self.s.threads.map_or(u32::MAX, |t| t[0]))
         });
         let mut indices = [z; 3];
+        // Each corner is a 9-bit vertex index with its edge flag above it
+        // (bits 9, 19, 29), which only the console's edge-flag rasterising
+        // reads: with the flag in the index it named a vertex past the
+        // written ones, and the triangle was culled.
         for (k, slot) in indices.iter_mut().enumerate() {
-            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x3FF));
+            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x1FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
             if let Some(n) = written {

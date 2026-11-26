@@ -326,6 +326,13 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        drop(heaps);
+        // Its run of title-memory views goes with it: a heap made later at
+        // the same address must not find this one's run (fork pull request
+        // #589, AscilCH).
+        if let Some(Some(host)) = self.host.get() {
+            crate::memory::forget_heap(host);
+        }
     }
 }
 

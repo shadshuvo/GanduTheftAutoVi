@@ -3202,7 +3202,9 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                // With `VICTORY_DIRTY_4K`: the 4 KiB pages the kernel found, read before the copy's lock.
+                let subs = crate::watch::subpages(from, to);
+                let copied = self.copy_stale(from, to, now, &written, &subs);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -3284,11 +3286,19 @@ impl Shadow {
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    ///
+    /// `subs` ([`crate::watch::subpages`], `VICTORY_DIRTY_4K`): for a page the kernel's write watch found written,
+    /// the 4 KiB pages its last asking found and the asking before that which found the page written. A copy that
+    /// took the page at or after that earlier asking copies only those 4 KiB pages: the others have not been written
+    /// since it took them (`crate::watch::dirty4k`).
+    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], subs: &[(usize, u64, u64, u16)]) -> usize {
+        const KERNEL_PAGE: usize = 4096;
+        let narrow = !subs.is_empty() && crate::watch::dirty4k();
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
+        let mut subs = subs.iter().peekable();
+        let (mut bytes, mut run): (_, Option<usize>) = (0, None);
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -3298,13 +3308,46 @@ impl Shadow {
                 }
                 _ => 0,
             };
+            while subs.peek().is_some_and(|s| s.0 < page) {
+                subs.next();
+            }
+            // The page's entry, if it stands for the asking the refresh was given for the page.
+            let sub = subs.peek().filter(|s| s.0 == page && s.1 == write && write != 0).map(|s| (s.2, s.3));
             let at = &mut copied[page - base];
             if *at == 0 || write > *at {
+                let taken = *at;
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     *at = now;
+                }
+                // Only the 4 KiB pages written since the copy took the page: the asking before the last one that
+                // found it written came no later than the copy's taking.
+                let found = sub.filter(|&(before, _)| taken != 0 && before <= taken).map(|(_, bits)| bits);
+                if crate::watch::dirty4k_kept() {
+                    crate::watch::dirty4k_count(found, narrow && found.is_some());
+                }
+                if narrow && let Some(bits) = found {
+                    if let Some(first) = run.take() {
+                        bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                    }
+                    let mut k = 0;
+                    while k < PAGE / KERNEL_PAGE {
+                        if bits & (1 << k) == 0 {
+                            k += 1;
+                            continue;
+                        }
+                        let a = k;
+                        while k < PAGE / KERNEL_PAGE && bits & (1 << k) != 0 {
+                            k += 1;
+                        }
+                        let (lo, hi) = ((page * PAGE + a * KERNEL_PAGE).max(from), (page * PAGE + k * KERNEL_PAGE).min(to));
+                        if lo < hi {
+                            bytes += self.copy(lo, hi);
+                        }
+                    }
+                    continue;
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
