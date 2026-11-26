@@ -61,7 +61,8 @@ impl Cache {
         let tmp = tempfile_in(dir);
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(true)
             .open(&tmp)?;
         let written = file.write_all(&output);
         drop(file);

@@ -14,6 +14,7 @@ use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
 pub(crate) struct HostHeap {
+    id: u64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -961,7 +962,9 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             heap,
             cpu,
             step,
@@ -1679,6 +1682,10 @@ impl HostHeap {
         }
         self.clear_twin(index);
         self.keep(index, None);
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     fn twin(&self, index: u32) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
