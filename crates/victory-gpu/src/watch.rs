@@ -54,16 +54,102 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     })
 }
 
+const SHARDS: usize = 64;
+const SHARD_SHIFT: usize = 4;
+
+fn shard_of(page: usize) -> usize {
+    (page >> SHARD_SHIFT) & (SHARDS - 1)
+}
+
+struct Shard {
+    written: BTreeMap<usize, u64>,
+    sub: BTreeMap<usize, (u64, u64, u16)>,
+}
+
+impl Shard {
+    const fn new() -> Self {
+        Shard {
+            written: BTreeMap::new(),
+            sub: BTreeMap::new(),
+        }
+    }
+}
+
+/// 64-way sharded page notes (adapted from avatarmanz Renderer Port 7).
+struct Notes([std::sync::RwLock<Shard>; SHARDS]);
+
+impl Notes {
+    const fn new() -> Self {
+        Notes([const { std::sync::RwLock::new(Shard::new()) }; SHARDS])
+    }
+
+    fn shard_mut(&self, page: usize) -> std::sync::RwLockWriteGuard<'_, Shard> {
+        self.0[shard_of(page)].write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn read(&self, shard: usize) -> std::sync::RwLockReadGuard<'_, Shard> {
+        self.0[shard].read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn range(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
+        if first >= last {
+            return Vec::new();
+        }
+        let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
+        if b - a < 4 * SHARDS {
+            let mut out = Vec::new();
+            for piece in a..=b {
+                let from = first.max(piece << SHARD_SHIFT);
+                let to = last.min((piece + 1) << SHARD_SHIFT);
+                let s = self.read(piece & (SHARDS - 1));
+                out.extend(s.written.range(from..to).map(|(&p, &w)| (p, w)));
+            }
+            out
+        } else {
+            let mut out = Vec::new();
+            for shard in 0..SHARDS {
+                out.extend(self.read(shard).written.range(first..last).map(|(&p, &w)| (p, w)));
+            }
+            out.sort_unstable();
+            out
+        }
+    }
+
+    fn sub_range(&self, first: usize, last: usize) -> Vec<(usize, u64, u64, u16)> {
+        if first >= last {
+            return Vec::new();
+        }
+        let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
+        if b - a < 4 * SHARDS {
+            let mut out = Vec::new();
+            for piece in a..=b {
+                let from = first.max(piece << SHARD_SHIFT);
+                let to = last.min((piece + 1) << SHARD_SHIFT);
+                let s = self.read(piece & (SHARDS - 1));
+                out.extend(s.sub.range(from..to).map(|(&p, &(asked, before, bits))| (p, asked, before, bits)));
+            }
+            out
+        } else {
+            let mut out = Vec::new();
+            for shard in 0..SHARDS {
+                out.extend(
+                    self.read(shard)
+                        .sub
+                        .range(first..last)
+                        .map(|(&p, &(asked, before, bits))| (p, asked, before, bits)),
+                );
+            }
+            out.sort_unstable_by_key(|x| x.0);
+            out
+        }
+    }
+}
+
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
-    /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
-    /// With `VICTORY_DIRTY_4K` ([`dirty4k`]): page number → the asking of `written` for it, the asking before that
-    /// which had found it written (0: never), and the 4 KiB kernel pages of it that asking found written (bit k: bytes
-    /// `k * 4096..(k + 1) * 4096` of the page). Only where the kernel's write watch answered: a page noted written
-    /// any other way (the guards, our own writes) has no entry, and counts as written whole.
-    sub: BTreeMap<usize, (u64, u64, u16)>,
+    /// Sharded per-page notes (`written` and `sub`).
+    notes: Notes,
     /// Room for the kernel's answer.
     found: Vec<usize>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
@@ -77,15 +163,22 @@ struct Journal {
     kept: bool,
 }
 
-static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
+static JOURNAL: std::sync::RwLock<Journal> = std::sync::RwLock::new(Journal {
     asked: 0,
-    written: BTreeMap::new(),
-    sub: BTreeMap::new(),
+    notes: Notes::new(),
     found: Vec::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
 });
+
+fn journal_read() -> std::sync::RwLockReadGuard<'static, Journal> {
+    JOURNAL.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn journal_write() -> std::sync::RwLockWriteGuard<'static, Journal> {
+    JOURNAL.write().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
@@ -111,7 +204,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal_write();
     let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
@@ -182,7 +275,10 @@ pub(crate) fn slow_asks() -> [u64; 3] {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    if journal_read().kept {
+        return;
+    }
+    let mut j = journal_write();
     if !j.kept {
         j.ahead.clear();
     }
@@ -221,7 +317,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     ask_once_end();
     ask_ahead(ranges);
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal_write();
     let j = &mut *j;
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
@@ -257,32 +353,31 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !journal_read().kept {
+        return;
+    }
+    let mut j = journal_write();
     if j.kept {
         j.kept = false;
         j.ahead.clear();
     }
 }
 
-/// We wrote title memory `[at, at + len)` while a submission's one asking
-/// stands (the title's buffer copies, done at submission): its pages count
-/// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    if !j.kept || len == 0 {
+    if len == 0 || !journal_read().kept {
+        return;
+    }
+    let mut j = journal_write();
+    if !j.kept {
         return;
     }
     j.asked += 1;
     let now = j.asked;
-    // The asking that stands moves with it: `asked` and `writes` give it as
-    // "now", and a page noted written after "now" stays stale for every
-    // copy that takes it (copied at `now`, written at `now + 1`): copied
-    // again at every refresh, and a reason to settle flights
-    // (fxceless/victory-fork#410).
     j.ahead_asked = now;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
-        j.written.insert(page, now);
-        j.sub.remove(&page);
+        let mut s = j.notes.shard_mut(page);
+        s.written.insert(page, now);
+        s.sub.remove(&page);
     }
 }
 
@@ -295,22 +390,23 @@ pub(crate) fn wrote(at: usize, len: usize) {
 /// last found `page` written (0: never) and the new one, for the copy
 /// that wrote to note itself current.
 pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal_write();
     let j = &mut *j;
     j.asked += 1;
     let now = j.asked;
-    // As in [`wrote`]: an asking that stands for a submission, or for a
-    // flush, moves with it, or a copy taking the page at the standing
-    // asking would find it written "later" at every refresh.
     if j.kept || !j.ahead.is_empty() {
         j.ahead_asked = now;
     }
-    let before = j.written.insert(page, now).unwrap_or(0);
-    j.sub.remove(&page);
+    let before = {
+        let mut s = j.notes.shard_mut(page);
+        s.sub.remove(&page);
+        s.written.insert(page, now).unwrap_or(0)
+    };
     for &other in others {
         if other != page {
-            j.written.insert(other, now);
-            j.sub.remove(&other);
+            let mut s = j.notes.shard_mut(other);
+            s.written.insert(other, now);
+            s.sub.remove(&other);
         }
     }
     (before, now)
@@ -376,21 +472,22 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 
 /// Notes in the journal that the kernel's asking `now` found the 4 KiB page at `at` written: its 64 KiB page as
 /// written at `now`, and with [`dirty4k_kept`] which of its 4 KiB pages the asking found ([`Journal::sub`]).
-fn note_kernel(j: &mut Journal, at: usize, now: u64) {
+fn note_kernel(j: &Journal, at: usize, now: u64) {
     let page = at / PAGE;
-    let before = j.written.insert(page, now).unwrap_or(0);
+    let mut s = j.notes.shard_mut(page);
+    let before = s.written.insert(page, now).unwrap_or(0);
     if !dirty4k_kept() {
         return;
     }
     let bit = 1u16 << ((at % PAGE) / KERNEL_PAGE);
     if before == now {
-        if let Some(entry) = j.sub.get_mut(&page)
+        if let Some(entry) = s.sub.get_mut(&page)
             && entry.0 == now
         {
             entry.2 |= bit;
         }
     } else {
-        j.sub.insert(page, (now, before, bit));
+        s.sub.insert(page, (now, before, bit));
     }
 }
 
@@ -436,8 +533,7 @@ pub(crate) fn subpages(start: usize, end: usize) -> Vec<(usize, u64, u64, u16)> 
         return Vec::new();
     }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    j.sub.range(first..last).map(|(&p, &(asked, before, bits))| (p, asked, before, bits)).collect()
+    journal_read().notes.sub_range(first, last)
 }
 
 /// Since the start, with `VICTORY_DIRTY_4K`.
@@ -472,33 +568,28 @@ pub(crate) fn dirty4k_count(found: Option<u16>, narrowed: bool) {
 /// it). `None` if the kernel would have to be asked.
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = journal_read();
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+        .then(|| (j.ahead_asked, j.notes.range(first, last)))
 }
 
-/// The pages of `[start, end)` (whole pages) as last written, for pages
-/// written since tracking began: `(page number, asking)` in page order, and
-/// this asking's number, which is higher than any in the list but those the
-/// kernel just reported. `None` if the memory is not write-watched (nor,
-/// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    // Fast shared path when the range is already in the standing asking.
+    {
+        let j = journal_read();
+        if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+            return Some((j.ahead_asked, j.notes.range(first, last)));
+        }
+    }
+    let mut j = journal_write();
     let j = &mut *j;
-    // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((
-            j.ahead_asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
+        return Some((j.ahead_asked, j.notes.range(first, last)));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -562,16 +653,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         note_kernel(j, at, now);
     }
     for page in guarded {
-        j.written.insert(page, now);
-        j.sub.remove(&page);
+        let mut s = j.notes.shard_mut(page);
+        s.written.insert(page, now);
+        s.sub.remove(&page);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    Some((now, j.notes.range(first, last)))
 }
 
 /// Diagnostics: one in 2,048 of the askings the kernel's write watch
@@ -661,7 +747,7 @@ fn known_view(start: usize) -> bool {
     if ask {
         return false;
     }
-    let g = guards();
+    let g = guards_shared();
     let first = start / BLOCK;
     g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
 }
@@ -701,12 +787,12 @@ struct Guards {
 /// each change said in the log, for measuring it in one scene. (Blocks
 /// noted in one phase are forgotten at a remapping in either.)
 fn view_known() -> bool {
-    /// 0 off, 1 on, 2 in turn.
+    /// 0 off, 1 on, 2 in turn. Default on (`1`) per Port 6 view-memory skip; `VICTORY_VIEW_KNOWN=0` disables.
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     match *MODE.get_or_init(|| match std::env::var("VICTORY_VIEW_KNOWN").as_deref() {
-        Ok("1") => 1,
+        Ok("0") => 0,
         Ok("alt") => 2,
-        _ => 0,
+        _ => 1,
     }) {
         0 => false,
         1 => true,
@@ -725,7 +811,7 @@ fn view_known() -> bool {
     }
 }
 
-static GUARDS: Mutex<Guards> = Mutex::new(Guards {
+static GUARDS: std::sync::RwLock<Guards> = std::sync::RwLock::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
@@ -733,14 +819,18 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     viewed: BTreeSet::new(),
 });
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+fn guards() -> std::sync::RwLockWriteGuard<'static, Guards> {
+    GUARDS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+fn guards_shared() -> std::sync::RwLockReadGuard<'static, Guards> {
+    GUARDS.read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Whether the block `page` is read-only by our hand and unwritten since a
 /// copy took it (diagnostics of `VICTORY_BACK_OWN_CHECK`).
 pub(crate) fn clean(page: usize) -> bool {
-    guards().clean.contains(&page)
+    guards_shared().clean.contains(&page)
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -756,7 +846,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
-        let g = guards();
+        let g = guards_shared();
         let first = start / BLOCK;
         g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
     };
