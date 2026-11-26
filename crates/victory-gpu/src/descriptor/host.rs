@@ -24,6 +24,10 @@ pub(crate) struct HostHeap {
     /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
     dynamic: u32,
     sampler: bool,
+    /// First raw-SRV twin slot (`victory_shader::emit::raw_views`; 0: none).
+    raw: u32,
+    /// Which slots currently have a non-null raw twin.
+    twins: Vec<std::sync::atomic::AtomicBool>,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
     /// A fingerprint of the record each slot held when the pass over
@@ -793,6 +797,12 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// The host's limit for shader-visible view heaps on resource binding
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
+const RAW_TWINS: u32 = 1 << 21;
+
+fn raw_twins() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_VIEWS").is_none_or(|v| v != "0"))
+}
 
 /// The size of every host view heap on a host that takes more than
 /// [`PORTABLE_VIEWS`] (AMD): the title's heap (a little over 1,000,000
@@ -830,13 +840,20 @@ pub(crate) fn probe_view_limit() {
             };
             made.is_ok()
         };
-        let views = if fits(UNCAPPED_VIEWS) {
+        let twins = raw_twins() && fits(2 * RAW_TWINS);
+        if twins {
+            victory_shader::emit::set_raw_views(RAW_TWINS);
+        }
+        let views = if twins {
+            RAW_TWINS
+        } else if fits(UNCAPPED_VIEWS) {
             UNCAPPED_VIEWS
         } else {
             PORTABLE_VIEWS
         };
         tracing::info!(
             views,
+            raw_twins = twins,
             "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
         );
         victory_shader::emit::set_view_heap_limit(views - 1);
@@ -888,6 +905,7 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
+        let raw = if sampler { 0 } else { victory_shader::emit::raw_views() };
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
@@ -897,7 +915,7 @@ impl HostHeap {
                 }
             }
         } else {
-            let size = null + 1;
+            let size = if raw == 0 { null + 1 } else { 2 * raw };
             let fitted = if count + extra <= null {
                 count
             } else {
@@ -950,6 +968,10 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
+            raw,
+            twins: (0..if raw != 0 && !sampler { count + extra } else { 0 })
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
             made: Mutex::new(vec![0; count as usize]),
             copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
@@ -1640,7 +1662,8 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let kept = make(view, self.cpu(index));
+        let kept = make_twinned(view, self.cpu(index), self.twin(index));
+        self.twin_made(index, kept.is_some());
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
@@ -1654,7 +1677,83 @@ impl HostHeap {
         } else {
             null_view(self.cpu(index));
         }
+        self.clear_twin(index);
         self.keep(index, None);
+    }
+
+    fn twin(&self, index: u32) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        (index < self.twins.len() as u32).then(|| self.cpu(self.raw + index))
+    }
+
+    fn twin_made(&self, index: u32, made: bool) {
+        if !made {
+            return self.clear_twin(index);
+        }
+        if let Some(shown) = self.twins.get(index as usize) {
+            shown.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn clear_twin(&self, index: u32) {
+        if let Some(made) = self.twins.get(index as usize)
+            && made.swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            null_buffer_view(self.cpu(self.raw + index));
+        }
+    }
+
+    /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
+    /// one) show the constant buffer of `size` bytes at `gpu` of `buffer`
+    /// (title memory in place) with nothing copied: its raw twin a raw view
+    /// of those bytes, which translated shaders read; the slot itself a
+    /// constant buffer view of them where that can be (on 256 bytes), else a
+    /// null one.
+    pub(crate) fn constant_raw_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) -> bool {
+        let Some(host) = host() else { return false };
+        let Some(twin) = self.twin(index) else { return false };
+        // SAFETY: a live buffer.
+        let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+        let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width && crate::port_cbv::raw_ok(o)) else {
+            return false;
+        };
+        let bytes = u64::from(constant_view_bytes(size)).min(width - offset) & !3;
+        if bytes == 0 {
+            return false;
+        }
+        let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: offset / 4,
+                    NumElements: (bytes / 4) as u32,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        let cbv = if gpu.is_multiple_of(256) {
+            let aligned = constant_view_bytes(size).min(((width - offset) & !255) as u32);
+            if aligned == 0 {
+                D3D12_CONSTANT_BUFFER_VIEW_DESC::default()
+            } else {
+                D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                    BufferLocation: gpu,
+                    SizeInBytes: aligned,
+                }
+            }
+        } else {
+            D3D12_CONSTANT_BUFFER_VIEW_DESC::default()
+        };
+        // SAFETY: slots of our heaps; the ranges lie in the live buffer.
+        unsafe {
+            host.device.CreateConstantBufferView(Some(&cbv), self.cpu(index));
+            host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
+        }
+        self.twin_made(index, true);
+        self.keep(index, Some(buffer.clone()));
+        true
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
@@ -1993,7 +2092,9 @@ impl HostHeap {
             let kept = if later {
                 None
             } else {
-                make(&view, self.cpu(index))
+                let k = make_twinned(&view, self.cpu(index), self.twin(index));
+                self.twin_made(index, k.is_some());
+                k
             };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
@@ -2703,6 +2804,102 @@ fn twin_uav(
 
 pub(crate) fn constant_view_bytes(requested: u32) -> u32 {
     requested.min(D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16)
+}
+
+/// Makes the host descriptor for `view` at `at` and optionally its raw twin at `twin`.
+fn constant_twinned(
+    buffer: &ID3D12Resource,
+    gpu: u64,
+    size: u32,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
+) -> bool {
+    let Some(host) = host() else { return false };
+    // SAFETY: a live buffer.
+    let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+    let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width) else {
+        return false;
+    };
+    let room = width - offset;
+    let cbv = if gpu.is_multiple_of(256) && room >= 256 {
+        D3D12_CONSTANT_BUFFER_VIEW_DESC {
+            BufferLocation: gpu,
+            SizeInBytes: constant_view_bytes(size).min((room & !255) as u32),
+        }
+    } else {
+        D3D12_CONSTANT_BUFFER_VIEW_DESC::default()
+    };
+    let bytes = u64::from(constant_view_bytes(size)).min(room) & !3;
+    // SAFETY: slots of our heaps; the ranges lie in the live buffer.
+    unsafe {
+        host.device.CreateConstantBufferView(Some(&cbv), at);
+        if let Some(twin) = twin {
+            let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: offset / 4,
+                        NumElements: (bytes / 4) as u32,
+                        StructureByteStride: 0,
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    },
+                },
+            };
+            if bytes == 0 {
+                null_buffer_view(twin);
+            } else {
+                host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
+            }
+            crate::port_cbv::twinned();
+        }
+    }
+    true
+}
+
+fn make_twinned(
+    view: &View,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
+) -> Option<Kept> {
+    let host = host()?;
+    let device = &host.device;
+    match view {
+        &View::Constant(address, size) => {
+            let shadow = crate::shadow::find(address, u64::from(size.max(1)))?;
+            let gpu = shadow.gpu(address);
+            if crate::port_cbv::on() {
+                return constant_twinned(&shadow.buffer, gpu, size, at, twin)
+                    .then(|| Some(shadow.buffer.clone()));
+            }
+            let size = constant_view_bytes(size)
+                .next_multiple_of(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+            if size == 0 || address == 0 {
+                return None;
+            }
+            if gpu % 256 != 0 {
+                once!(
+                    address = format_args!("{address:#x}"),
+                    "constant buffer not 256-byte aligned on the host"
+                );
+                return None;
+            }
+            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                BufferLocation: gpu,
+                SizeInBytes: size,
+            };
+            // SAFETY: slots of our heap; the range lies in the host copy.
+            unsafe {
+                device.CreateConstantBufferView(Some(&desc), at);
+                if let Some(twin) = twin {
+                    device.CreateConstantBufferView(Some(&desc), twin);
+                }
+            }
+            Some(Some(shadow.buffer.clone()))
+        }
+        _ => make(view, at),
+    }
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it

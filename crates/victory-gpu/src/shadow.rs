@@ -2387,6 +2387,11 @@ impl Shadow {
         shadow
     }
 
+    /// Whether this buffer is title memory placed in place (no host copy).
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
