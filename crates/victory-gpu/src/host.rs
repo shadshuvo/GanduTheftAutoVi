@@ -3678,6 +3678,7 @@ fn late_line(frames: f64) {
         s[13],
         s[14],
     );
+    crate::port::log(frames);
     {
         let w: Vec<f64> = LATE_WAITED.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames).collect();
         tracing::info!(
@@ -7189,6 +7190,7 @@ impl HostList {
                     batch.title_wrote(dst, len);
                     #[cfg(feature = "diagnostics")]
                     fill_check::copy_runs(dst, src, len);
+                    crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -7201,6 +7203,7 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                         fill_check::runs(src, len);
                     }
+                    crate::port::filled(src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
