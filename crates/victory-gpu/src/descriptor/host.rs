@@ -2494,6 +2494,7 @@ fn buffer_srv(
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
 ) -> Option<Kept> {
     let shadow = crate::shadow::find(address, len)?;
     let offset = shadow.offset(address);
@@ -2567,7 +2568,33 @@ fn buffer_srv(
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
-            .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
+            .CreateShaderResourceView(&shadow.buffer, Some(&desc), at);
+        if let Some(twin) = twin {
+            let twin_desc = if raw {
+                Some(desc)
+            } else if stride != 0 && (first * u64::from(stride)).is_multiple_of(4) {
+                let byte_len = u64::from(count) * u64::from(stride);
+                if byte_len.is_multiple_of(4) && byte_len > 0 {
+                    let mut d = desc;
+                    d.Format = DXGI_FORMAT_R32_TYPELESS;
+                    d.Anonymous.Buffer = D3D12_BUFFER_SRV {
+                        FirstElement: (first * u64::from(stride)) / 4,
+                        NumElements: (byte_len / 4) as u32,
+                        StructureByteStride: 0,
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    };
+                    Some(d)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            match twin_desc {
+                Some(d) => host.device.CreateShaderResourceView(&shadow.buffer, Some(&d), twin),
+                None => null_buffer_view(twin),
+            }
+        }
     };
     Some(Some(shadow.buffer.clone()))
 }
@@ -2898,13 +2925,21 @@ fn make_twinned(
             }
             Some(Some(shadow.buffer.clone()))
         }
-        _ => make(view, at),
+        _ => make_inner(view, at, twin),
     }
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+    make_inner(view, at, None)
+}
+
+fn make_inner(
+    view: &View,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
+) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
@@ -2999,7 +3034,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
-                buffer_srv(data as u64, len, srv_desc(desc), at)
+                buffer_srv(data as u64, len, srv_desc(desc), at, twin)
             } else {
                 None
             }
@@ -3100,7 +3135,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if *unordered {
                 buffer_uav(address, len, uav_desc(words), at)
             } else {
-                buffer_srv(address, len, srv_desc(words), at)
+                buffer_srv(address, len, srv_desc(words), at, twin)
             }
         }
     }

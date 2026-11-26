@@ -74,6 +74,10 @@ fn build() -> &'static [u8; 32] {
                 if victory_shader::emit::constants_raw() {
                     bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
                 }
+                if victory_shader::emit::raw_views() != 0 {
+                    bytes.extend_from_slice(b"RAW_VIEWS=");
+                    bytes.extend_from_slice(&victory_shader::emit::raw_views().to_le_bytes());
+                }
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
