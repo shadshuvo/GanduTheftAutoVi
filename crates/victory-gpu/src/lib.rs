@@ -52,6 +52,8 @@ pub mod pipeline;
 mod plaincopy;
 #[cfg(windows)]
 mod primitive;
+#[cfg(windows)]
+mod residency;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 pub mod query;

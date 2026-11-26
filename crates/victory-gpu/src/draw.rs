@@ -1969,6 +1969,17 @@ impl State {
         let per_frame: u64 = *PER_FRAME_MB.get_or_init(|| {
             std::env::var("VICTORY_TEXTURE_STAGE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(192)
         }) << 20;
+        let per_frame = if crate::residency::admit_texture_pass(false) {
+            crate::residency::prefetch_limit(
+                per_frame,
+                crate::residency::pressured(),
+                crate::residency::critical_commit(),
+                crate::residency::limited_host_ram(),
+                crate::host::ALIVE[4].load(Ordering::Relaxed),
+            )
+        } else {
+            0
+        };
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();

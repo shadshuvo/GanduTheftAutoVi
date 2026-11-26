@@ -3679,6 +3679,7 @@ fn late_line(frames: f64) {
         s[14],
     );
     crate::port::log(frames);
+    crate::residency::refresh();
     {
         let w: Vec<f64> = LATE_WAITED.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames).collect();
         tracing::info!(
@@ -7817,6 +7818,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
             }
