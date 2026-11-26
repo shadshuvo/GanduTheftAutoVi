@@ -5,7 +5,7 @@
 //! it is written: functions, then constants (all at module level), then the
 //! instructions of `main` in block order.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub mod census;
 pub mod opt;
@@ -543,6 +543,84 @@ impl Module {
             });
         }
         live
+    }
+
+    /// The blocks a block's terminator branches to.
+    fn successors(&self, b: usize) -> Vec<usize> {
+        match self.blocks[b].term {
+            Some(Term::Br(t)) => vec![t],
+            Some(Term::CondBr(_, t, f)) => vec![t, f],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Gives every loop header one back edge, as DXC's code has:
+    /// vkd3d-proton's DXIL conversion keeps one per header, takes any other
+    /// for a forward edge and then recurses without end over the cycle that
+    /// makes (in programs with wave shuffles). The back edges of a header
+    /// with several go through a new block that joins their phi values.
+    pub fn single_latches(&mut self) {
+        let n = self.blocks.len();
+        if n == 0 {
+            return;
+        }
+        // Depth-first from the entry: an edge to a block still on the stack
+        // is a back edge (the control flow is reducible).
+        let mut state = vec![0u8; n];
+        let mut stack = vec![(0usize, 0usize)];
+        state[0] = 1;
+        let mut latches: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            let succ = self.successors(b);
+            if k < succ.len() {
+                top.1 += 1;
+                let t = succ[k];
+                match state[t] {
+                    0 => {
+                        state[t] = 1;
+                        stack.push((t, 0));
+                    }
+                    1 => latches.entry(t).or_default().push(b),
+                    _ => {}
+                }
+            } else {
+                state[b] = 2;
+                stack.pop();
+            }
+        }
+        for (header, mut from) in latches {
+            from.sort_unstable();
+            from.dedup();
+            if from.len() < 2 {
+                continue;
+            }
+            let latch = self.new_block();
+            for &b in &from {
+                let to = |t: usize| if t == header { latch } else { t };
+                self.blocks[b].term = match self.blocks[b].term {
+                    Some(Term::Br(t)) => Some(Term::Br(to(t))),
+                    Some(Term::CondBr(c, t, f)) => Some(Term::CondBr(c, to(t), to(f))),
+                    other => other,
+                };
+            }
+            self.blocks[latch].term = Some(Term::Br(header));
+            for id in self.blocks[header].phis.clone() {
+                let Op::Phi(incoming) = self.insts[id as usize].op.clone() else {
+                    continue;
+                };
+                let ty = self.insts[id as usize].ty;
+                let (back, mut rest): (Vec<_>, Vec<_>) =
+                    incoming.into_iter().partition(|(_, b)| from.contains(b));
+                if back.is_empty() {
+                    continue;
+                }
+                let joined = self.phi(latch, ty);
+                self.set_phi(joined, back);
+                rest.push((joined, latch));
+                self.insts[id as usize].op = Op::Phi(rest);
+            }
+        }
     }
 
     pub fn write(&self) -> Vec<u8> {
