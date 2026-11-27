@@ -127,6 +127,7 @@ pub extern "system" fn XGCreateTextureComputer(
     {
         return o.create(desc, out.cast());
     }
+    // SAFETY: caller provides `desc`; `as_ref()` checks nullness.
     let (Some(&desc), false) = (unsafe { desc.as_ref() }, out.is_null()) else {
         return E_INVALIDARG;
     };
@@ -166,6 +167,7 @@ pub extern "system" fn XGCreateTextureComputer(
         if !real.is_null() {
             // SAFETY: plain data, filled by the call; a live real computer.
             let mut theirs: Box<LayoutOut> = Box::new(unsafe { std::mem::zeroed() });
+            // SAFETY: `real` is a non-null real XG texture computer COM object.
             let get: extern "system" fn(*mut c_void, *mut LayoutOut) -> HRESULT =
                 unsafe { xg_oracle::slot(real, 2) };
             get(real, &mut *theirs);
@@ -1022,6 +1024,7 @@ mod tests {
                 unsafe { (Box::new(std::mem::zeroed()), Box::new(std::mem::zeroed())) };
             layout(c, &mut *a);
             // SAFETY: a live real computer.
+            // SAFETY: `real` is a non-null real XG texture computer COM object.
             let get: extern "system" fn(*mut c_void, *mut LayoutOut) -> HRESULT =
                 unsafe { xg_oracle::slot(real, 2) };
             get(real, &mut *b);

@@ -183,6 +183,7 @@ struct Pages {
     extra_pages: HashMap<(usize, usize), Page>,
     idle: VecDeque<(PageKey, std::time::Instant)>,
     targets: HashMap<usize, Target>,
+    #[allow(dead_code)]
     waited: HashMap<usize, u64>,
 }
 
@@ -717,6 +718,7 @@ pub(crate) fn forget(resource: usize) {
 
 /// Ensures `queue` waits on any pending `UpdateTileMappings` fence before
 /// executing command lists.
+#[allow(dead_code)]
 pub(crate) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let mut dev: Option<ID3D12Device> = None;
     // SAFETY: `queue` is a valid command queue.

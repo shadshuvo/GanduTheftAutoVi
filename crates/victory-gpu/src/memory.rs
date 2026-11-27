@@ -331,6 +331,7 @@ pub(crate) fn forget_heap(heap: &HostHeap) {
 /// Whether a run of title-memory views is kept for the host view heap at
 /// address `key` (tests).
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn has_run(key: usize) -> bool {
     MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.heaps.contains_key(&key))
 }
