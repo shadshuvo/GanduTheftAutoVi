@@ -268,12 +268,71 @@ fn bury(finished: u64) {
         *retired = keep;
         done
     };
-    drop(done);
+    let objects: Vec<Retired> = done.into_iter().map(|(_, r)| r).collect();
+    if let Some(tx) = reaper()
+        && let Err(std::sync::mpsc::SendError(Reaped::Objects(objects))) = tx.send(Reaped::Objects(objects))
+    {
+        drop(objects);
+    }
 }
+
+/// Whether what the host is done with is let go of on a thread of its own
+/// ([`reaper`]; `VICTORY_REAPER=1`, off by default).
+fn reaping() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REAPER").is_some_and(|v| v == "1"))
+}
+
+/// Resets landed host command lists and drops retired objects off the
+/// submitting thread ([`reaping`], adapted from mgrein a2cf68bb).
+fn reaper() -> Option<&'static std::sync::mpsc::Sender<Reaped>> {
+    if !reaping() {
+        return None;
+    }
+    static REAPER: OnceLock<Option<std::sync::mpsc::Sender<Reaped>>> = OnceLock::new();
+    REAPER
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<Reaped>();
+            std::thread::Builder::new()
+                .name("victory-reaper".into())
+                .spawn(move || {
+                    for reaped in rx {
+                        match reaped {
+                            Reaped::Lists(landed) => {
+                                for (lists, order) in landed {
+                                    crate::list::recycle(lists, &order);
+                                }
+                            }
+                            Reaped::Objects(objects) => {
+                                drop(objects);
+                            }
+                        }
+                    }
+                })
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
+}
+
+enum Reaped {
+    Lists(Vec<(Vec<crate::list::Detached>, Vec<usize>)>),
+    Objects(Vec<Retired>),
+}
+
+// SAFETY: the lists have run and nothing else names them; D3D12 objects
+// are free-threaded and `Retired` is `Send`.
+unsafe impl Send for Reaped {}
 
 /// Objects [`retire`] dropped at once (no submission was running) and
 /// kept until a running submission finished, since the start.
 static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether `Present` waits for vertical sync (`VICTORY_VSYNC=1`; off by default).
+fn vsync() -> u32 {
+    static ON: OnceLock<u32> = OnceLock::new();
+    *ON.get_or_init(|| u32::from(std::env::var_os("VICTORY_VSYNC").is_some_and(|v| v == "1")))
+}
 
 /// What the layer did to the host's objects lately, newest last (sweeps
 /// that let host copies go, pipeline library calls, saves and trims): said
@@ -3524,6 +3583,17 @@ pub(crate) fn settle_for_fence() {
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
     let landed = std::mem::take(&mut line().landed);
+    if landed.is_empty() {
+        return;
+    }
+    let landed = match reaper() {
+        Some(tx) => match tx.send(Reaped::Lists(landed)) {
+            Ok(()) => return,
+            Err(std::sync::mpsc::SendError(Reaped::Lists(landed))) => landed,
+            Err(_) => return,
+        },
+        None => landed,
+    };
     for (lists, order) in landed {
         crate::list::recycle(lists, &order);
     }
@@ -8499,7 +8569,7 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let _ = p.swap_chain.Present(vsync(), DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));

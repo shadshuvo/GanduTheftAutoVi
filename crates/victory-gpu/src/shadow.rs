@@ -3824,73 +3824,146 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         return loose(address, end, len <= 1, any);
     };
     let entry = map.get_mut(&key)?;
-    if entry.shadow.is_none() {
-        let len = entry.end - key.0;
-        // Rounded up so that views ending in the buffer's last 256 bytes fit.
-        // Shaders write some buffers (unordered access), so not upload memory.
-        let size = len.next_multiple_of(1 << 16);
-        // In place, if asked for and the memory can be opened
-        // (`crate::inplace::place_for`): the buffer is the title's own
-        // memory. Not the big ones `cards` puts in the card's memory: those
-        // are read too often to stay in the PC's.
-        let big = cards() && size >= card_limits().0;
-        // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
-        // title's 32-bit graphics heap in place, big or not.
-        if let Some(placed) = crate::port::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
-        }
-        if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
-        }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
-                crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
-                tracing::info!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
-                let card = Card {
-                    staging: buffer,
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
-                    size,
-                };
-                (on_card, Some(card))
-            }
-            None => (buffer, None),
-        };
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        if len >= 16 << 20 {
+    if let Some(shadow) = &entry.shadow {
+        return Some(shadow.clone());
+    }
+    let len = entry.end - key.0;
+    if copy_ahead() {
+        drop(map);
+        return made_aside(key, len);
+    }
+    let shadow = make_shadow_for_entry(key, len)?;
+    entry.shadow = Some(shadow.clone());
+    Some(shadow)
+}
+
+fn make_shadow_for_entry(key: (u64, usize), len: u64) -> Option<Arc<Shadow>> {
+    // Rounded up so that views ending in the buffer's last 256 bytes fit.
+    // Shaders write some buffers (unordered access), so not upload memory.
+    let size = len.next_multiple_of(1 << 16);
+    // In place, if asked for and the memory can be opened
+    // (`crate::inplace::place_for`): the buffer is the title's own
+    // memory. Not the big ones `cards` puts in the card's memory: those
+    // are read too often to stay in the PC's.
+    let big = cards() && size >= card_limits().0;
+    // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
+    // title's 32-bit graphics heap in place, big or not.
+    if let Some(placed) = crate::port::place_for(key.0, len, false) {
+        return Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+    }
+    if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
+        return Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+    }
+    let (buffer, data) = host()?.shared_buffer(size)?;
+    crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+    // A big one, with `cards`: shaders get a buffer in the card's own
+    // memory, and the one just made is the CPU's side.
+    let (buffer, card) = match card_for(size) {
+        Some(on_card) => {
+            crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
             tracing::info!(
                 start = format_args!("{:#x}", key.0),
                 len,
-                "large buffer copied to the host"
+                "a buffer's host copy is in the card's memory"
             );
-        } else {
-            tracing::debug!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "buffer copied to the host"
-            );
+            let card = Card {
+                staging: buffer,
+                before: Mutex::default(),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
+                size,
+            };
+            (on_card, Some(card))
         }
-        let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
-        shadow.card = card;
-        let shadow = Arc::new(shadow);
-        if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
-        }
-        entry.shadow = Some(shadow);
+        None => (buffer, None),
+    };
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    if len >= 16 << 20 {
+        tracing::info!(
+            start = format_args!("{:#x}", key.0),
+            len,
+            "large buffer copied to the host"
+        );
+    } else {
+        tracing::debug!(
+            start = format_args!("{:#x}", key.0),
+            len,
+            "buffer copied to the host"
+        );
     }
-    entry.shadow.clone()
+    let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
+    shadow.card = card;
+    let shadow = Arc::new(shadow);
+    if shadow.card.is_some() {
+        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    }
+    Some(shadow)
+}
+
+/// Whether the copy of a title buffer is made as soon as the title declares
+/// the buffer, on a thread of its own (`victory-ahead`), instead of at the
+/// first view a draw names in it (`VICTORY_COPY_AHEAD=1`; off by default).
+pub(crate) fn copy_ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_AHEAD").is_some_and(|v| v == "1"))
+}
+
+static AHEAD: Mutex<std::collections::VecDeque<(u64, usize)>> = Mutex::new(std::collections::VecDeque::new());
+static AHEAD_MOVED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// The title declared the buffer `resource` at `start` ([`register`]): with
+/// [`copy_ahead`], its copy is made soon on the thread `victory-ahead`.
+pub(crate) fn declared(resource: usize, start: u64) {
+    if !copy_ahead() {
+        return;
+    }
+    static THREAD: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    THREAD.get_or_init(|| {
+        if let Err(e) = std::thread::Builder::new().name("victory-ahead".into()).spawn(ahead) {
+            tracing::warn!(error = %e, "no thread to make copies ahead (VICTORY_COPY_AHEAD)");
+        }
+    });
+    AHEAD.lock().unwrap_or_else(|e| e.into_inner()).push_back((start, resource));
+    AHEAD_MOVED.notify_one();
+}
+
+fn ahead() {
+    loop {
+        let key = {
+            let mut queue = AHEAD.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                match queue.pop_front() {
+                    Some(key) => break key,
+                    None => queue = AHEAD_MOVED.wait(queue).unwrap_or_else(|e| e.into_inner()),
+                }
+            }
+        };
+        let len = {
+            let map = buffers();
+            match map.get(&key) {
+                Some(Entry { end, shadow: None }) => Some(*end - key.0),
+                _ => None,
+            }
+        };
+        if let Some(len) = len {
+            let _ = made_aside(key, len);
+        }
+    }
+}
+
+fn made_aside(key: (u64, usize), len: u64) -> Option<Arc<Shadow>> {
+    static MAKING: Mutex<()> = Mutex::new(());
+    let _turn = MAKING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(Entry { shadow: Some(shadow), .. }) = buffers().get(&key) {
+        return Some(shadow.clone());
+    }
+    let shadow = make_shadow_for_entry(key, len)?;
+    let mut map = buffers();
+    match map.get_mut(&key) {
+        Some(entry) => Some(entry.shadow.get_or_insert(shadow).clone()),
+        None => Some(shadow),
+    }
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (

@@ -190,6 +190,14 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1")) && !crate::drvwatch::tripped()
 }
 
+/// Renderer port 1: indirect draws whose arguments or counter are read in
+/// place are clamped alone right before they run (`VICTORY_PORT_CONSTANTS_ORDER`,
+/// on by default; `=0` disables).
+fn in_place_order() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_CONSTANTS_ORDER").is_none_or(|v| v != "0"))
+}
+
 /// Whether a record that is not on the window's walk opens a window of its
 /// own at once, with the step the title was last seen to walk that
 /// argument buffer by (`VICTORY_WINDOW_JUMP=1`; `alt`: twenty seconds
@@ -3400,7 +3408,10 @@ impl State {
         } else {
             None
         };
-        let windowed = windows()
+        let in_place = args.in_place() || counter.as_ref().is_some_and(|(s, _)| s.in_place());
+        let ordered = in_place && in_place_order();
+        let windowed = !ordered
+            && windows()
             && kind != DISPATCH
             && max == 1
             && count.is_none()
