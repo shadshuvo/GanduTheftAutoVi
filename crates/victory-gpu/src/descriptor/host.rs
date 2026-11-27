@@ -1777,18 +1777,49 @@ impl HostHeap {
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
     /// of `buffer` from byte `offset` (a multiple of 16): a root SRV with a
+    /// Bound dynamic raw views to their host buffer (`VICTORY_RAW_VIEW_CLAMP`, on; `=0` disables).
+    fn raw_view_clamp() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_VIEW_CLAMP").is_none_or(|v| v != "0"))
+    }
+
+    fn raw_range(size: u64, offset: u64, len: u64) -> Option<(u64, u32)> {
+        let words = size / 4;
+        if !offset.is_multiple_of(16) {
+            return None;
+        }
+        let asked = offset / 4;
+        if asked >= words {
+            return None;
+        }
+        let avail = words - asked;
+        let want = (len / 4).max(1);
+        let elements = want.min(avail).min(u64::from(u32::MAX)) as u32;
+        Some((asked, elements))
+    }
+
     /// size, whose reads past it return zeros instead of reaching whatever
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        let (first, elements) = if Self::raw_view_clamp() {
+            // SAFETY: `buffer` is a live D3D12 resource.
+            let width = unsafe { buffer.GetDesc().Width };
+            let Some(range) = Self::raw_range(width, offset, len) else {
+                self.null_raw_at(index);
+                return;
+            };
+            range
+        } else {
+            (offset / 4, (len / 4).clamp(1, u64::from(u32::MAX)) as u32)
+        };
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: offset / 4,
+                    FirstElement: first,
                     NumElements: elements,
                     StructureByteStride: 0,
                     Flags: D3D12_BUFFER_SRV_FLAG_RAW,
@@ -1816,13 +1847,23 @@ impl HostHeap {
     /// reaching whatever the host placed after the buffer.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        let (first, elements) = if Self::raw_view_clamp() {
+            // SAFETY: `buffer` is a live D3D12 resource.
+            let width = unsafe { buffer.GetDesc().Width };
+            let Some(range) = Self::raw_range(width, offset, len) else {
+                self.null_raw_uav_at(index);
+                return;
+            };
+            range
+        } else {
+            (offset / 4, (len / 4).clamp(1, u64::from(u32::MAX)) as u32)
+        };
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_UAV {
-                    FirstElement: offset / 4,
+                    FirstElement: first,
                     NumElements: elements,
                     StructureByteStride: 0,
                     CounterOffsetInBytes: 0,
