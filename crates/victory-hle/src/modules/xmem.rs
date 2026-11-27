@@ -785,6 +785,17 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
+    if side_by_side() > 1 && n >= 3 {
+        // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
+        let wanted: Vec<(usize, usize)> = (0..n)
+            .map(|i| unsafe {
+                let addr = *addresses.add(i) as usize;
+                let page = if pages.is_null() { 0 } else { *pages.add(i) };
+                (addr, page)
+            })
+            .collect();
+        return BOOL::from(scatter(&wanted));
+    }
     for i in 0..n {
         // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
         let (address, page) = unsafe {
@@ -802,6 +813,356 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
         }
     }
     1
+}
+
+/// Pages changed under the locks at once.
+const GROUP: usize = 64;
+
+/// Threads while the title streams fast (`VICTORY_MAP_THREADS=auto`).
+const WIDE: usize = 16;
+
+/// How many threads map a group of pages side by side (`VICTORY_MAP_THREADS`;
+/// 8 unless set; 1: the caller alone; `auto`: 1 while mapping takes little of
+/// the time, [`WIDE`] while the title streams as fast as its pages are mapped).
+fn side_by_side() -> usize {
+    match asked_threads() {
+        Some(n) => n,
+        None if BUSY.2.load(Ordering::Relaxed) => WIDE,
+        None => 1,
+    }
+}
+
+/// `VICTORY_MAP_THREADS` as a number; `None`: `auto`.
+fn asked_threads() -> Option<usize> {
+    static ASKED: LazyLock<Option<usize>> = LazyLock::new(|| match std::env::var("VICTORY_MAP_THREADS") {
+        Ok(v) if v.trim() == "auto" => None,
+        v => Some(v.ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8).clamp(1, 32)),
+    });
+    *ASKED
+}
+
+static BUSY: (
+    Mutex<Option<std::time::Instant>>,
+    std::sync::atomic::AtomicU64,
+    std::sync::atomic::AtomicBool,
+) = (
+    Mutex::new(None),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicBool::new(false),
+);
+
+struct Busy(std::time::Instant);
+
+impl Busy {
+    fn begin() -> Busy {
+        Busy(std::time::Instant::now())
+    }
+}
+
+/// Whether mapping is busy after a window of `window` with `spent` in it.
+fn busy_after(was: bool, spent: std::time::Duration, window: std::time::Duration) -> bool {
+    spent * if was { 20 } else { 4 } > window
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        const WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+        let now = std::time::Instant::now();
+        let dt = (now - self.0).as_nanos() as u64;
+        let all = BUSY.1.fetch_add(dt, Ordering::Relaxed) + dt;
+        let mut began = BUSY.0.lock().unwrap_or_else(|e| e.into_inner());
+        let window = now - *began.get_or_insert(self.0);
+        if window < WINDOW {
+            return;
+        }
+        *began = Some(now);
+        BUSY.1.store(0, Ordering::Relaxed);
+        let was = BUSY.2.load(Ordering::Relaxed);
+        let is = busy_after(was, std::time::Duration::from_nanos(all), window);
+        if was != is {
+            BUSY.2.store(is, Ordering::Relaxed);
+            static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if asked_threads().is_none()
+                && SAID.fetch_add(1, Ordering::Relaxed) < 200
+            {
+                tracing::info!(
+                    "title pages are mapped by {} (VICTORY_MAP_THREADS): {:.0} ms of the last {:.0} ms went into mapping calls",
+                    if is { "several threads" } else { "the caller alone" },
+                    all as f64 / 1e6,
+                    window.as_secs_f64() * 1e3
+                );
+            }
+        }
+    }
+}
+
+struct MapOp {
+    at: usize,
+    slice: Option<Slice>,
+    had: bool,
+}
+
+impl MapOp {
+    fn run(&self) -> bool {
+        if self.had {
+            // SAFETY: a view we mapped; it becomes a placeholder again.
+            let gone = unsafe {
+                UnmapViewOfFile2(
+                    GetCurrentProcess(),
+                    MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: self.at as *mut c_void,
+                    },
+                    MEM_PRESERVE_PLACEHOLDER,
+                )
+            };
+            if gone == 0 {
+                return false;
+            }
+        }
+        let Some(slice) = &self.slice else {
+            return true;
+        };
+        // SAFETY: maps the section over a placeholder of `PAGE` bytes.
+        let view = unsafe {
+            MapViewOfFile3(
+                slice.section.handle,
+                GetCurrentProcess(),
+                self.at as *const c_void,
+                (slice.index * PAGE) as u64,
+                PAGE,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if view.Value as usize != self.at {
+            tracing::warn!(
+                address = format_args!("{:#x}", self.at),
+                len = PAGE,
+                error = %std::io::Error::last_os_error(),
+                "mapping physical pages failed (not a placeholder?)"
+            );
+            return false;
+        }
+        let lazy =
+            !on_wine() && std::env::var_os("VICTORY_LAZY_PAGES").is_none_or(|v| v != "0");
+        if !lazy && !commit(self.at, PAGE) {
+            // SAFETY: the view just mapped, back to a placeholder.
+            unsafe {
+                UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
+            }
+            return false;
+        }
+        true
+    }
+}
+
+fn scatter(wanted: &[(usize, usize)]) -> bool {
+    let mut ok = true;
+    let mut at = 0;
+    while at < wanted.len() {
+        let _busy = Busy::begin();
+        let mut physical = physical();
+        let mut ops: Vec<MapOp> = Vec::new();
+        let mut touched = std::collections::HashSet::new();
+        for &(to, page) in &wanted[at..] {
+            if ops.len() == GROUP || !touched.insert(to) {
+                break;
+            }
+            let slice = if page == 0 {
+                None
+            } else {
+                let s = physical.pages.get(&page).cloned();
+                if s.is_none() {
+                    tracing::warn!(page, "XMemMapPhysicalPagesScatter: unknown page");
+                    ok = false;
+                }
+                s
+            };
+            ops.push(MapOp {
+                at: to,
+                slice,
+                had: false,
+            });
+            at += 1;
+        }
+        for op in &mut ops {
+            let there = physical
+                .views
+                .range(..=op.at)
+                .next_back()
+                .filter(|(base, (size, _))| op.at < **base + *size)
+                .map(|(base, (size, _))| (*base, *size));
+            match there {
+                Some((base, PAGE)) if base == op.at => {
+                    physical.views.remove(&op.at);
+                    crate::modules::lazy::unmark(op.at);
+                    victory_gpu::title_memory_remapped(op.at, PAGE);
+                    op.had = true;
+                }
+                Some(_) => {
+                    unmap(&mut physical, op.at, PAGE);
+                }
+                None => {}
+            }
+            if !op.had && op.slice.is_some() {
+                // SAFETY: splits a larger placeholder on the caller thread before workers map.
+                unsafe {
+                    VirtualFree(
+                        op.at as *mut c_void,
+                        PAGE,
+                        MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+                    );
+                }
+            }
+        }
+        let lazy =
+            !on_wine() && std::env::var_os("VICTORY_LAZY_PAGES").is_none_or(|v| v != "0");
+        let done = map_pool::all(ops);
+        for (op, succeeded) in done {
+            match op.slice {
+                Some(slice) if succeeded => {
+                    if lazy {
+                        crate::modules::lazy::mark(op.at);
+                    }
+                    slice.section.mark_committed(slice.index, 1);
+                    victory_gpu::title_memory_remapped(op.at, PAGE);
+                    physical.views.insert(op.at, (PAGE, slice));
+                }
+                _ => ok &= succeeded,
+            }
+        }
+    }
+    ok
+}
+
+mod map_pool {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+    use super::{MapOp, side_by_side};
+
+    struct Batch {
+        ops: Vec<(MapOp, AtomicBool)>,
+        next: AtomicUsize,
+        left: AtomicUsize,
+        over: (Mutex<bool>, Condvar),
+    }
+
+    impl Batch {
+        fn work(&self) {
+            loop {
+                let i = self.next.fetch_add(1, Ordering::Relaxed);
+                let Some((op, done)) = self.ops.get(i) else {
+                    return;
+                };
+                done.store(op.run(), Ordering::Release);
+                if self.left.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    *self.over.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                    self.over.1.notify_all();
+                }
+            }
+        }
+    }
+
+    struct Pool {
+        batches: Mutex<VecDeque<Arc<Batch>>>,
+        more: Condvar,
+    }
+
+    fn pool() -> &'static Pool {
+        static POOL: OnceLock<Pool> = OnceLock::new();
+        static STARTED: std::sync::Once = std::sync::Once::new();
+        let pool = POOL.get_or_init(|| Pool {
+            batches: Mutex::default(),
+            more: Condvar::new(),
+        });
+        STARTED.call_once(|| {
+            let n_threads = super::asked_threads().unwrap_or(super::WIDE).max(side_by_side());
+            let started = (1..n_threads)
+                .filter(|i| {
+                    std::thread::Builder::new()
+                        .name(format!("mapping {i}"))
+                        .spawn(|| serve(pool))
+                        .is_ok()
+                })
+                .count();
+            tracing::info!(
+                started,
+                "threads that map pages side by side (VICTORY_MAP_THREADS=1: none)"
+            );
+        });
+        pool
+    }
+
+    fn serve(pool: &Pool) {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+        };
+        // SAFETY: plain call on our own thread.
+        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
+        let mut batches = pool.batches.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let Some(batch) = batches.front().cloned() else {
+                batches = pool.more.wait(batches).unwrap_or_else(|e| e.into_inner());
+                continue;
+            };
+            if batch.next.load(Ordering::Relaxed) >= batch.ops.len() {
+                if batches.front().is_some_and(|b| Arc::ptr_eq(b, &batch)) {
+                    batches.pop_front();
+                }
+                continue;
+            }
+            drop(batches);
+            batch.work();
+            batches = pool.batches.lock().unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    pub(super) fn all(ops: Vec<MapOp>) -> Vec<(MapOp, bool)> {
+        if ops.len() < 3 {
+            return ops
+                .into_iter()
+                .map(|op| {
+                    let done = op.run();
+                    (op, done)
+                })
+                .collect();
+        }
+        let n = ops.len();
+        let batch = Arc::new(Batch {
+            ops: ops.into_iter().map(|op| (op, AtomicBool::new(false))).collect(),
+            next: AtomicUsize::new(0),
+            left: AtomicUsize::new(n),
+            over: Default::default(),
+        });
+        let pool = pool();
+        pool.batches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(batch.clone());
+        if n > side_by_side() {
+            pool.more.notify_all();
+        } else {
+            (1..n).for_each(|_| pool.more.notify_one());
+        }
+        batch.work();
+        let mut over = batch.over.0.lock().unwrap_or_else(|e| e.into_inner());
+        while !*over {
+            over = batch.over.1.wait(over).unwrap_or_else(|e| e.into_inner());
+        }
+        drop(over);
+        let Ok(batch) = Arc::try_unwrap(batch) else {
+            unreachable!("batch finished");
+        };
+        batch
+            .ops
+            .into_iter()
+            .map(|(op, done)| (op, done.into_inner()))
+            .collect()
+    }
 }
 
 /// Maps the physical pages shown at `[from, from + len)` at `to` as well,
@@ -1414,6 +1775,14 @@ mod tests {
         );
         assert_eq!(XMemFreePhysicalPages(2, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn mapping_is_busy_from_a_quarter_of_the_time_to_a_twentieth() {
+        let ms = std::time::Duration::from_millis;
+        assert!(!busy_after(false, ms(60), ms(250)) && busy_after(false, ms(70), ms(250)));
+        assert!(busy_after(true, ms(15), ms(250)) && !busy_after(true, ms(12), ms(250)));
+        assert!(!busy_after(true, ms(5), ms(4000)));
     }
 
     #[test]
