@@ -1132,7 +1132,7 @@ mod map_pool {
                 .collect();
         }
         let n = ops.len();
-        let batch = Arc::new(Batch {
+        let mut batch = Arc::new(Batch {
             ops: ops.into_iter().map(|op| (op, AtomicBool::new(false))).collect(),
             next: AtomicUsize::new(0),
             left: AtomicUsize::new(n),
@@ -1154,8 +1154,18 @@ mod map_pool {
             over = batch.over.1.wait(over).unwrap_or_else(|e| e.into_inner());
         }
         drop(over);
-        let Ok(batch) = Arc::try_unwrap(batch) else {
-            unreachable!("batch finished");
+        {
+            let mut batches = pool.batches.lock().unwrap_or_else(|e| e.into_inner());
+            batches.retain(|b| !Arc::ptr_eq(b, &batch));
+        }
+        let batch = loop {
+            match Arc::try_unwrap(batch) {
+                Ok(b) => break b,
+                Err(b) => {
+                    batch = b;
+                    std::thread::yield_now();
+                }
+            }
         };
         batch
             .ops
